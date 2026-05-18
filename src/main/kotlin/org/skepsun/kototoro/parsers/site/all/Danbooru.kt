@@ -86,7 +86,7 @@ internal class DanbooruParser(context: ContentLoaderContext) : PagedContentParse
 			filter.contentRating.oneOrThrowIfMany()?.let {
 				when (it) {
 					ContentRating.SAFE -> finalTags.add("rating:g")
-					ContentRating.SUGGESTIVE -> finalTags.add("rating:q") // q maps to questionable/suggestive in danbooru usually
+					ContentRating.SUGGESTIVE -> finalTags.add("rating:s,q") // search for both sensitive and questionable
 					ContentRating.ADULT -> finalTags.add("rating:e") // explicit maps to adult
 					else -> { /* nothing */ }
 				}
