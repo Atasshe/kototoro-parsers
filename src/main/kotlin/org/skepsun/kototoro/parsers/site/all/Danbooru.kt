@@ -15,9 +15,6 @@ import org.skepsun.kototoro.parsers.util.*
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.*
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 @ContentSourceParser("Danbooru", "danbooru.donmai.us")
 internal class DanbooruParser(context: ContentLoaderContext) : PagedContentParser(
@@ -43,49 +40,64 @@ internal class DanbooruParser(context: ContentLoaderContext) : PagedContentParse
 
 	override suspend fun getFilterOptions() = ContentListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableContentRating = EnumSet.of(ContentRating.SAFE, ContentRating.SENSITIVE, ContentRating.QUESTIONABLE, ContentRating.EXPLICIT),
+		availableContentRating = EnumSet.of(ContentRating.SAFE, ContentRating.SUGGESTIVE, ContentRating.ADULT),
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: ContentListFilter): List<Content> {
-	
-                !filter.query.isNullOrEmpty() -> {
-                    // convert filter.query in tags
-			    }
+		val selectedTags = mutableListOf<String>()
 
-				val url = buildString {
-					append("https://")
-					append(domain)
+		if (!filter.query.isNullOrEmpty()) {
+			selectedTags.addAll(filter.query.split(" ").filter { it.isNotBlank() })
+		}
 
-					append("/posts.json?tags=")
-					when (order) {
-						SortOrder.UPDATED -> append("order:change")
-						SortOrder.POPULARITY -> append("order:score")
-						SortOrder.NEWEST -> append("")
-						else -> append("")
-					}
+		selectedTags.addAll(filter.tags.map { it.key })
+		selectedTags.addAll(filter.tagsExclude.map { "-" + it.key })
 
-					
+		val finalTags = mutableListOf<String>()
 
-					if (filter.contentRating.isNotEmpty()) {
-						filter.contentRating.oneOrThrowIfMany()?.let {
-							append(
-								when (it) {
-									ContentRating.SAFE -> append("rating:g"),
-                                    ContentRating.SENSITIVE -> append("rating:s"),
-                                    ContentRating.QUESTIONABLE -> append("rating:q"),
-                                    ContentRating.EXPLICIT -> append("rating:e"),
-									else -> append("")
-								},
-							)
-						}
-					}
+		// Max 2 tags for free users.
+		if (selectedTags.isNotEmpty()) {
+			val tagsJson = JSONArray(webClient.httpGet(
+				"https://$domain/tags.json?search[name_comma]=${selectedTags.joinToString(",")}"
+			).body())
 
-					append("&page=")
-					append(page.toString())
+			val tagsCountMap = mutableMapOf<String, Int>()
+			tagsJson.mapToList { obj ->
+				tagsCountMap[obj.getString("name")] = obj.getInt("post_count")
+			}
+
+			val sortedTags = selectedTags.sortedBy { tag ->
+				val cleanTag = tag.removePrefix("-")
+				tagsCountMap[cleanTag] ?: Int.MAX_VALUE
+			}
+
+			val maxTags = if (order != SortOrder.NEWEST) 1 else 2
+			finalTags.addAll(sortedTags.take(maxTags))
+		}
+
+		when (order) {
+			SortOrder.UPDATED -> finalTags.add("order:change")
+			SortOrder.POPULARITY -> finalTags.add("order:score")
+			SortOrder.NEWEST -> { /* nothing */ }
+			else -> { /* nothing */ }
+		}
+
+		if (filter.contentRating.isNotEmpty()) {
+			filter.contentRating.oneOrThrowIfMany()?.let {
+				when (it) {
+					ContentRating.SAFE -> finalTags.add("rating:g")
+					ContentRating.SUGGESTIVE -> finalTags.add("rating:q") // q maps to questionable/suggestive in danbooru usually
+					ContentRating.ADULT -> finalTags.add("rating:e") // explicit maps to adult
+					else -> { /* nothing */ }
 				}
+			}
+		}
 
-				return parseList(url, page)
-		
+		val tagsParam = finalTags.joinToString(" ")
+		val tagsEncoded = tagsParam.urlEncoded()
+		val url = "https://$domain/posts.json?tags=$tagsEncoded&page=$page"
+
+		return parseList(url, page)
 	}
 
 	override suspend fun getDetails(manga: Content): Content {
@@ -140,67 +152,64 @@ internal class DanbooruParser(context: ContentLoaderContext) : PagedContentParse
 		)
 	}
 
-	private suspend fun fetchAvailableTags(name: String = null): Set<ContentTag> {
-		val tags = JSONArray(webClient.httpGet(
-			"https://${domain}/tags.json?search[name_or_alias_matches]=${name}*&search[order]=count",
+	private suspend fun fetchAvailableTags(name: String? = null): Set<ContentTag> {
+		val nameParam = name ?: ""
+		val tagsJson = JSONArray(webClient.httpGet(
+			"https://$domain/tags.json?search[name_or_alias_matches]=${nameParam}*&search[order]=count",
 		).body())
-		val result = JSONArray()
-		return json.mapToList { obj ->
-			
-				result.append(ContentTag(
-					title = obj.getString("name").toTitleCase(Locale.ENGLISH),
-					))
-			
-			
+		val result = mutableSetOf<ContentTag>()
+		tagsJson.mapToList { obj ->
+			result.add(ContentTag(
+				title = obj.getString("name").toTitleCase(Locale.ENGLISH),
+				key = obj.getString("name"),
+				source = source
+			))
 		}
 		return result
-		throw ParseException("Cannot find gernes list", scripts[0].baseUri())
 	}
 
-	
 	private suspend fun parseList(url: String, page: Int): List<Content> {
-		val json = JSONArray(webClient.httpGet(url).body())
+		val jsonBody = webClient.httpGet(url).body()
+		if (jsonBody.isBlank()) return emptyList()
+
+		val json = JSONArray(jsonBody)
 		if (json == null) {
 			return emptyList()
 		}
 
 		return json.mapToList { obj ->
-            val rating = RATING_UNKNOWN
-            when {
-                obj.getString("rating") == "g" -> rating = RATING_SAFE,
-                obj.getString("rating") == "s" -> rating = RATING_SENSITIVE,
-                obj.getString("rating") == "q" -> rating = RATING_QUESTIONABLE,
-                obj.getString("rating") == "e" -> rating = RATING_EXPLICIT
+            val ratingStr = obj.optString("rating", "")
+			val contentRating = when (ratingStr) {
+                "g" -> ContentRating.SAFE
+                "s", "q" -> ContentRating.SUGGESTIVE
+                "e" -> ContentRating.ADULT
+				else -> null
             }
+
+			val tagsArray = obj.optString("tag_string", "").split(" ").filter { it.isNotBlank() }
+			val tags = tagsArray.map {
+				ContentTag(it.toTitleCase(Locale.ENGLISH), it, source)
+			}.toSet()
+
+			val authorsArray = obj.optString("tag_string_artist", "").split(" ").filter { it.isNotBlank() }
+			val authors = authorsArray.map { it.toTitleCase(Locale.ENGLISH) }.toSet()
+
 			Content(
-				id = obj.getString("id"),
-				title = obj.optString("title", ""),
-				altTitles = null,
-				url = domain + "/post/" + obj.getString("id"),
-				publicUrl = domain + "/post/" + obj.getString("id"),
-				rating = rating,
-				contentRating = null,
-				coverUrl = obj.optString("preview_file_url", "file_url"),
-				largeCoverUrl = obj.optString("large_file_url", "file_url"),
+				id = obj.getLong("id"),
+				title = obj.optString("title", "").ifEmpty { "Post ${obj.getLong("id")}" },
+				altTitles = emptySet(),
+				url = domain + "/post/" + obj.getLong("id"),
+				publicUrl = domain + "/post/" + obj.getLong("id"),
+				rating = RATING_UNKNOWN,
+				contentRating = contentRating,
+				coverUrl = obj.optString("preview_file_url", "").ifEmpty { obj.optString("file_url", "") },
+				largeCoverUrl = obj.optString("large_file_url", "").ifEmpty { obj.optString("file_url", "") },
 				description = null,
-				tags = obj.optJSONArray("tag_string", JSONArray()),
+				tags = tags,
 				state = null,
-				authors = obj.optJSONArray("tag_string_artist", JSONArray()),
-				source = obj.optString("source", ""),,
+				authors = authors,
+				source = source
 			)
 		}
 	}
-
-	private fun Element.parseTags() = children().mapToSet { span ->
-		val text = span.ownText()
-		ContentTag(
-			title = text.toTitleCase(),
-			key = text.lowercase(Locale.ENGLISH).replace(' ', '_'),
-			source = source,
-		)
-	}
-
-
-
-
 }
